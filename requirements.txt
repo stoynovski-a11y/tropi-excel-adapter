@@ -1,0 +1,14 @@
+# Core dependencies
+msal>=1.28,<2.0
+requests>=2.31,<3.0
+
+# tropi-storage-adapter (for logical-path resolution via M365_ROUTES)
+# Install from the local dev clone while the package is not on PyPI:
+#   pip install -e ~/dev/tropi-storage-adapter
+#
+# Or pin the GitHub commit:
+#   pip install git+https://github.com/stoynovski-a11y/tropi-storage-adapter.git@85a85e5
+#
+# tropi-storage-adapter is an OPTIONAL dependency: it is only needed when you
+# pass a logical path (e.g. "/SiteRoot/folder/file.xlsx") to open_workbook().
+# URL-based access works without it.

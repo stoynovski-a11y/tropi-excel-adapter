@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tropi-excel-adapter"
+version = "0.1.0"
+description = "High-level wrapper over the Microsoft Graph Excel REST API for SharePoint workbooks."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Tрopi Commodity ЕООД" }]
+keywords = ["excel", "sharepoint", "graph", "microsoft365", "workbook"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "msal>=1.28,<2.0",
+    "requests>=2.31,<3.0",
+]
+
+[project.optional-dependencies]
+# Install tropi-storage-adapter to enable logical-path resolution.
+routing = [
+    "tropi-storage-adapter @ git+https://github.com/stoynovski-a11y/tropi-storage-adapter.git@85a85e5",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "responses>=0.25",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tropi_excel*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q"
