@@ -224,6 +224,10 @@ class ExcelFileClient:
         self._write_lock = _get_write_lock(ef)
         # Cache: table_name → list of column headers (letter A, B, C… order)
         self._table_header_cache: dict[str, list[str]] = {}
+        # Cache: table_name → 0-based worksheet index of the table's first column
+        # (e.g. a table whose range starts at column C → 2).  Used to convert a
+        # worksheet column letter into a table-relative column index.
+        self._table_start_col_cache: dict[str, int] = {}
 
     # --- session context manager --------------------------------------------
 
@@ -325,19 +329,23 @@ class ExcelFileClient:
         """
         headers = self._get_table_headers(table)
 
-        # Resolve letter or name to a column index (1-based, per Graph API).
+        # Resolve letter or name to a 0-based TABLE-RELATIVE column index.
+        # NB: Graph's /columns/{key} matches by the column's internal *id*
+        # (e.g. "3", "46"), which is NOT the positional index — so we must
+        # address by position via columns/itemAt(index=N) instead.
         col_upper = column_name_or_letter.strip().upper()
         if len(col_upper) <= 3 and col_upper.isalpha():
-            # Treat as column letter → convert to 0-based index.
-            idx = _col_letter_to_index(col_upper)
-            if idx >= len(headers):
+            # Worksheet column letter → worksheet-absolute index, then make it
+            # table-relative by subtracting the table's start column.
+            idx = _col_letter_to_index(col_upper) - self._table_start_col(table)
+            if idx < 0 or idx >= len(headers):
                 raise ValueError(
                     f"Column letter {column_name_or_letter!r} is out of range "
                     f"for table {table!r} which has {len(headers)} columns."
                 )
-            col_id = str(idx + 1)  # Graph uses 1-based index as path
         else:
-            # Treat as column name.
+            # Column header text → its position within the table headers is
+            # already the 0-based table-relative index.
             lower = column_name_or_letter.strip().lower()
             try:
                 idx = next(i for i, h in enumerate(headers) if h.lower() == lower)
@@ -346,10 +354,11 @@ class ExcelFileClient:
                     f"Column {column_name_or_letter!r} not found in table {table!r}. "
                     f"Available headers: {headers}"
                 ) from None
-            col_id = str(idx + 1)
 
         # dataBodyRange = the column's data area, excluding header and total rows.
-        url = self._wb_url(f"/tables('{table}')/columns/{col_id}/dataBodyRange")
+        url = self._wb_url(
+            f"/tables('{table}')/columns/itemAt(index={idx})/dataBodyRange"
+        )
         r = self._sess().request("GET", url)
         data = r.json()
         rows = data.get("values", [])
@@ -367,6 +376,25 @@ class ExcelFileClient:
         headers: list[str] = [str(v) for v in (rows[0] if rows else [])]
         self._table_header_cache[table] = headers
         return headers
+
+    def _table_start_col(self, table: str) -> int:
+        """Return the 0-based worksheet index of *table*'s first column.
+
+        A table whose range is ``Въвод!A8:BE229`` starts at column A → 0;
+        one at ``Sheet!C2:F9`` → 2.  Used to translate a worksheet column
+        letter into a table-relative column index for ``columns/itemAt``.
+        """
+        if table in self._table_start_col_cache:
+            return self._table_start_col_cache[table]
+
+        url = self._wb_url(f"/tables('{table}')/range?$select=address")
+        r = self._sess().request("GET", url)
+        address = r.json().get("address", "")  # e.g. "Въвод!A8:BE229"
+        cell = address.split("!")[-1].split(":")[0]  # "A8"
+        letters = "".join(ch for ch in cell if ch.isalpha())  # "A"
+        start = _col_letter_to_index(letters) if letters else 0
+        self._table_start_col_cache[table] = start
+        return start
 
     # --- add_table_rows ------------------------------------------------------
 
@@ -390,12 +418,16 @@ class ExcelFileClient:
         """
         headers = self._get_table_headers(table)
         n_cols = len(headers)
+        start_col = self._table_start_col(table)
 
         def _row_to_array(row_dict: dict[str, Any]) -> list:
+            # The rows/add body is TABLE-relative: position 0 = the table's
+            # first column.  Convert each worksheet letter to a table-relative
+            # index by subtracting the table's start column.
             arr: list[Any] = [None] * n_cols
             for letter, value in row_dict.items():
-                idx = _col_letter_to_index(letter.strip().upper())
-                if idx < n_cols:
+                idx = _col_letter_to_index(letter.strip().upper()) - start_col
+                if 0 <= idx < n_cols:
                     arr[idx] = value
             return arr
 
