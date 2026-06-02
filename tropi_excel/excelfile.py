@@ -316,6 +316,47 @@ class ExcelFileClient:
             r = self._sess().request("PATCH", url, json=payload)
         return r.json()
 
+    # --- insert_rows ---------------------------------------------------------
+
+    def insert_rows(
+        self,
+        sheet: str,
+        start_row: int,
+        count: int,
+        shift: str = "Down",
+    ) -> dict:
+        """Insert *count* blank ENTIRE rows at *start_row*, shifting rows down.
+
+        Uses an entire-row range address (e.g. ``"5:7"``) so EVERY column shifts
+        together — inserting a partial-width range would misalign columns to the
+        right of the range.  The inserted rows inherit the number-format / style
+        of the row directly above (Excel/Graph default), so for an append just
+        above the last data row the new rows come out correctly styled with no
+        extra format-copy step (verified against the Продажби sheets).
+
+        Use for sheets WITHOUT a structured table (where ``add_table_rows`` does
+        not apply); for tables prefer ``add_table_rows(index=…)``.
+
+        Args:
+            sheet:     Worksheet name.
+            start_row: 1-based worksheet row to insert before.
+            count:     Number of rows to insert (>= 1).
+            shift:     Cell-shift direction; "Down" for a row insert.
+
+        Returns:
+            The Graph range object for the inserted range.
+        """
+        if count < 1:
+            raise ValueError("count must be >= 1")
+        end_row = start_row + count - 1
+        address = f"{start_row}:{end_row}"
+        url = self._wb_url(
+            f"/worksheets('{sheet}')/range(address='{address}')/insert"
+        )
+        with self._write_lock:
+            r = self._sess().request("POST", url, json={"shift": shift})
+        return r.json()
+
     # --- set_font_color ------------------------------------------------------
 
     def set_font_color(self, sheet: str, address: str, color: str) -> dict:
