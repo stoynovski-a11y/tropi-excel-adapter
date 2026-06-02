@@ -430,6 +430,21 @@ class ExcelFileClient:
         self._table_start_col_cache[table] = start
         return start
 
+    def table_data_start_row(self, table: str) -> int:
+        """Return the 1-based worksheet row of *table*'s FIRST data row.
+
+        For a table at ``Регистър!A4:U500`` the header is row 4, so the first
+        data-body row is 5.  Lets a caller translate a 0-based table data
+        index into an absolute sheet row (``data_start + index``) — needed to
+        write per-row absolute-reference formulas (e.g. ``=ROUND(I{r},2)``).
+        """
+        url = self._wb_url(f"/tables('{table}')/range?$select=address")
+        r = self._sess().request("GET", url)
+        address = r.json().get("address", "")  # e.g. "Регистър!A4:U500"
+        cell = address.split("!")[-1].split(":")[0]  # "A4"
+        digits = "".join(ch for ch in cell if ch.isdigit())  # "4" (header row)
+        return (int(digits) + 1) if digits else 1
+
     # --- add_table_rows ------------------------------------------------------
 
     def add_table_rows(
