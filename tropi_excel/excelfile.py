@@ -316,6 +316,38 @@ class ExcelFileClient:
             r = self._sess().request("PATCH", url, json=payload)
         return r.json()
 
+    # --- set_font_color ------------------------------------------------------
+
+    def set_font_color(self, sheet: str, address: str, color: str) -> dict:
+        """Set the font color of a range (e.g. flag a cell red).
+
+        Patches the range's ``format/font`` resource — independent of the
+        cell's value/formula, so it can be called after writing the value.
+
+        Args:
+            sheet:   Worksheet name.
+            address: A1-notation address (a single cell ``K9`` or a range).
+            color:   Hex color string ``#RRGGBB`` (e.g. ``"#FF0000"`` for red).
+
+        Returns:
+            The updated Graph rangeFont object.
+        """
+        if not (
+            isinstance(color, str)
+            and len(color) == 7
+            and color[0] == "#"
+            and all(c in "0123456789abcdefABCDEF" for c in color[1:])
+        ):
+            raise ValueError(
+                f"color must be a '#RRGGBB' hex string; got {color!r}."
+            )
+        url = self._wb_url(
+            f"/worksheets('{sheet}')/range(address='{address}')/format/font"
+        )
+        with self._write_lock:
+            r = self._sess().request("PATCH", url, json={"color": color})
+        return r.json()
+
     # --- table_column --------------------------------------------------------
 
     def table_column(self, table: str, column_name_or_letter: str) -> list:
