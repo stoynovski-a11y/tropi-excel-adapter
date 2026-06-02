@@ -36,10 +36,12 @@ exponential back-off.
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import threading
 import time
 from contextlib import contextmanager
+from decimal import Decimal
 from typing import Any, Generator
 
 import requests
@@ -300,7 +302,7 @@ class ExcelFileClient:
         """
         payload: dict[str, Any] = {}
         if values is not None:
-            payload["values"] = values
+            payload["values"] = _to_excel_grid(values)
         if formulas is not None:
             payload["formulas"] = formulas
         if number_format is not None:
@@ -428,7 +430,7 @@ class ExcelFileClient:
             for letter, value in row_dict.items():
                 idx = _col_letter_to_index(letter.strip().upper()) - start_col
                 if 0 <= idx < n_cols:
-                    arr[idx] = value
+                    arr[idx] = _to_excel_value(value)
             return arr
 
         values = [_row_to_array(r) for r in rows]
@@ -473,6 +475,37 @@ class ExcelFileClient:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Excel's day 0 is 1899-12-30 (the offset absorbs the fictional 1900-02-29 leap
+# day for all dates from 1900-03-01 onward, which covers every real-world date).
+_EXCEL_EPOCH = datetime.datetime(1899, 12, 30)
+
+
+def _to_excel_value(v: Any) -> Any:
+    """Coerce a Python value into something the Graph Excel API can JSON-encode.
+
+    The workbook range/table-row endpoints take values as a JSON body, so
+    ``datetime``/``date`` (not JSON-serialisable) and ``Decimal`` (rejected by
+    requests' encoder) must be converted first.  Dates become Excel serial
+    numbers so the cell's existing date number-format renders them correctly;
+    Decimals become floats.  Everything else passes through unchanged.
+    """
+    if isinstance(v, datetime.datetime):
+        delta = v - _EXCEL_EPOCH
+        return delta.days + (delta.seconds + delta.microseconds / 1e6) / 86400.0
+    if isinstance(v, datetime.date):  # plain date (datetime already handled above)
+        return (datetime.datetime(v.year, v.month, v.day) - _EXCEL_EPOCH).days
+    if isinstance(v, Decimal):
+        return float(v)
+    return v
+
+
+def _to_excel_grid(grid: list[list] | None) -> list[list] | None:
+    """Apply :func:`_to_excel_value` across a 2-D array (or return None)."""
+    if grid is None:
+        return None
+    return [[_to_excel_value(cell) for cell in row] for row in grid]
+
 
 def _col_letter_to_index(letter: str) -> int:
     """Convert an Excel column letter to a 0-based column index.
