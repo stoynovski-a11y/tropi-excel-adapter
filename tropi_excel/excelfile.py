@@ -445,6 +445,21 @@ class ExcelFileClient:
         digits = "".join(ch for ch in cell if ch.isdigit())  # "4" (header row)
         return (int(digits) + 1) if digits else 1
 
+    def table_name_for_sheet(self, sheet: str) -> str:
+        """Return the name of the (first) table on *sheet*.
+
+        Many workbooks have exactly one table per sheet but its name is not
+        known to the caller (Excel auto-names them ``Table1``, ``Таблица1``,
+        etc.).  This resolves it at runtime so callers needn't hardcode it.
+        Raises ExcelNotFoundError if the sheet has no table.
+        """
+        url = self._wb_url(f"/worksheets('{sheet}')/tables?$select=name")
+        r = self._sess().request("GET", url)
+        tables = r.json().get("value", [])
+        if not tables:
+            raise ExcelNotFoundError(f"No table found on worksheet {sheet!r}.")
+        return tables[0]["name"]
+
     # --- add_table_rows ------------------------------------------------------
 
     def add_table_rows(
