@@ -62,6 +62,7 @@ BACKOFF_CAP = 30.0   # seconds
 # 404 itemNotFound. Only used when the caller opts in via
 # session(retry_not_found=True). Budget ≈ 1+2+4+8+16 = 31s of propagation lag.
 CREATE_SESSION_NOT_FOUND_RETRIES = 5
+BATCH_MAX = 20       # Graph $batch hard limit (requests per call)
 
 # Module-level write locks: (drive_id, item_id) → Lock
 _write_locks: dict[tuple[str, str], threading.Lock] = {}
@@ -99,6 +100,10 @@ class _ExcelSession:
         if self._session_id:
             h["workbook-session-id"] = self._session_id
         return h
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
 
     # --- session lifecycle ---------------------------------------------------
 
@@ -338,6 +343,78 @@ class ExcelFileClient:
         with self._write_lock:
             r = self._sess().request("PATCH", url, json=payload)
         return r.json()
+
+    # --- set_ranges (batched) ------------------------------------------------
+
+    def set_ranges(self, ops: list[dict]) -> None:
+        """Apply many range writes in as few round-trips as possible via $batch.
+
+        Each op is a dict with ``sheet``, ``address``, and any of ``values``,
+        ``formulas``, ``number_format``. Equivalent to calling set_range() once
+        per op, but the writes are sent in Graph ``$batch`` chunks of <=20.
+
+        Ordering: every ``number_format`` write is applied (and completed)
+        BEFORE any value/formula write. Graph coerces number-looking strings
+        unless the cell is Text(@) first, so the format must land before the
+        value — the same ordering the per-cell helpers relied on. This is why
+        callers can pass number_format and values in a single op safely.
+
+        Raises ExcelApiError if any sub-request reports a failure status. A
+        failed batch may have partially applied; callers re-run idempotently
+        (each op overwrites a fixed cell).
+        """
+        fmt_reqs: list[tuple[str, dict]] = []
+        val_reqs: list[tuple[str, dict]] = []
+        for op in ops:
+            suffix = f"/worksheets('{op['sheet']}')/range(address='{op['address']}')"
+            rel_url = self._wb_url(suffix)
+            if rel_url.startswith(GRAPH):
+                rel_url = rel_url[len(GRAPH):]
+            if op.get("number_format") is not None:
+                fmt_reqs.append((rel_url, {"numberFormat": op["number_format"]}))
+            body: dict[str, Any] = {}
+            if op.get("values") is not None:
+                body["values"] = _to_excel_grid(op["values"])
+            if op.get("formulas") is not None:
+                body["formulas"] = op["formulas"]
+            if body:
+                val_reqs.append((rel_url, body))
+
+        with self._write_lock:
+            self._flush_batch(fmt_reqs)
+            self._flush_batch(val_reqs)
+
+    def _flush_batch(self, reqs: list[tuple[str, dict]]) -> None:
+        """PATCH each (url, body) via Graph ``$batch``, <=BATCH_MAX per call."""
+        if not reqs:
+            return
+        sess = self._sess()
+        sub_headers = {"Content-Type": "application/json"}
+        session_id = getattr(sess, "session_id", None)
+        if session_id:
+            sub_headers["workbook-session-id"] = session_id
+        for start in range(0, len(reqs), BATCH_MAX):
+            chunk = reqs[start:start + BATCH_MAX]
+            payload = {
+                "requests": [
+                    {
+                        "id": str(n),
+                        "method": "PATCH",
+                        "url": url,
+                        "headers": sub_headers,
+                        "body": body,
+                    }
+                    for n, (url, body) in enumerate(chunk)
+                ]
+            }
+            resp = sess.request("POST", "/$batch", json=payload)
+            for sub in resp.json().get("responses", []):
+                if sub.get("status", 0) >= 400:
+                    raise ExcelApiError(
+                        sub.get("status", 0),
+                        f"$batch sub-request {sub.get('id')} failed: "
+                        f"{str(sub.get('body'))[:300]}",
+                    )
 
     # --- insert_rows ---------------------------------------------------------
 
