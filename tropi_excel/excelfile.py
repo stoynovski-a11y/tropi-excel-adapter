@@ -56,6 +56,12 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 MAX_RETRIES = 3
 BACKOFF_BASE = 1.0   # seconds
 BACKOFF_CAP = 30.0   # seconds
+# Extra createSession retries for a workbook that was JUST created — e.g. a
+# server-side copy in "new" mode. The drive item exists, but SharePoint has not
+# finished activating it for the Excel API, so createSession briefly returns
+# 404 itemNotFound. Only used when the caller opts in via
+# session(retry_not_found=True). Budget ≈ 1+2+4+8+16 = 31s of propagation lag.
+CREATE_SESSION_NOT_FOUND_RETRIES = 5
 
 # Module-level write locks: (drive_id, item_id) → Lock
 _write_locks: dict[tuple[str, str], threading.Lock] = {}
@@ -96,8 +102,8 @@ class _ExcelSession:
 
     # --- session lifecycle ---------------------------------------------------
 
-    def open(self) -> None:
-        self._session_id = self._create_session()
+    def open(self, retry_not_found: bool = False) -> None:
+        self._session_id = self._create_session(retry_not_found=retry_not_found)
 
     def close(self) -> None:
         if not self._session_id:
@@ -112,9 +118,18 @@ class _ExcelSession:
             pass  # best-effort close
         self._session_id = None
 
-    def _create_session(self) -> str:
-        """POST createSession, retry 504 up to MAX_RETRIES times."""
-        for attempt in range(MAX_RETRIES + 1):
+    def _create_session(self, retry_not_found: bool = False) -> str:
+        """POST createSession.
+
+        Always retries 504 (gateway) up to MAX_RETRIES. When ``retry_not_found``
+        is set, also retries 404 itemNotFound with a longer budget — used right
+        after a server-side copy ("new" mode), where the copied workbook exists
+        but SharePoint has not yet activated it for the Excel API.
+        """
+        max_attempts = (
+            CREATE_SESSION_NOT_FOUND_RETRIES if retry_not_found else MAX_RETRIES
+        )
+        for attempt in range(max_attempts + 1):
             r = requests.post(
                 f"{self._ef.item_base_url}/workbook/createSession",
                 headers=self._base_headers(),
@@ -123,11 +138,14 @@ class _ExcelSession:
             )
             if r.ok:
                 return r.json()["id"]
-            if r.status_code == 504 and attempt < MAX_RETRIES:
+            retriable = r.status_code == 504 or (
+                retry_not_found and r.status_code == 404
+            )
+            if retriable and attempt < max_attempts:
                 delay = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_CAP)
                 logger.warning(
-                    "createSession 504, retry %d/%d in %.1fs",
-                    attempt + 1, MAX_RETRIES, delay,
+                    "createSession %d, retry %d/%d in %.1fs",
+                    r.status_code, attempt + 1, max_attempts, delay,
                 )
                 time.sleep(delay)
                 continue
@@ -234,10 +252,15 @@ class ExcelFileClient:
     # --- session context manager --------------------------------------------
 
     @contextmanager
-    def session(self) -> Generator[None, None, None]:
-        """Open a Graph workbook session for the duration of the block."""
+    def session(self, *, retry_not_found: bool = False) -> Generator[None, None, None]:
+        """Open a Graph workbook session for the duration of the block.
+
+        Set ``retry_not_found=True`` when the workbook was just created by a
+        server-side copy, so a transient post-copy 404 itemNotFound is retried
+        (waiting for SharePoint to activate it) instead of failing immediately.
+        """
         sess = _ExcelSession(self._ef, self._token_provider)
-        sess.open()
+        sess.open(retry_not_found=retry_not_found)
         self._session = sess
         try:
             yield
