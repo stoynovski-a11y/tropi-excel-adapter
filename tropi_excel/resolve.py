@@ -50,6 +50,7 @@ class ExcelFile:
 
     drive_id: str
     item_id: str
+    source_key: str | None = None
 
     @property
     def item_base_url(self) -> str:
@@ -70,7 +71,7 @@ def resolve(path_or_url: str, token_provider: "TokenProvider") -> ExcelFile:
     with _cache_lock:
         if key in _cache:
             drive_id, item_id = _cache[key]
-            return ExcelFile(drive_id=drive_id, item_id=item_id)
+            return ExcelFile(drive_id=drive_id, item_id=item_id, source_key=key)
 
     token = token_provider.get_token()
 
@@ -81,7 +82,14 @@ def resolve(path_or_url: str, token_provider: "TokenProvider") -> ExcelFile:
 
     with _cache_lock:
         _cache[key] = (drive_id, item_id)
-    return ExcelFile(drive_id=drive_id, item_id=item_id)
+    return ExcelFile(drive_id=drive_id, item_id=item_id, source_key=key)
+
+
+def invalidate(path_or_url: str) -> None:
+    """Drop the cached (drive_id, item_id) for a path, if present."""
+    key = path_or_url.strip()
+    with _cache_lock:
+        _cache.pop(key, None)
 
 
 # ---------------------------------------------------------------------------

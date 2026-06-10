@@ -47,7 +47,7 @@ from typing import Any, Generator
 import requests
 
 from .errors import ExcelApiError, ExcelNotFoundError, ExcelThrottledError
-from .resolve import ExcelFile
+from .resolve import ExcelFile, invalidate as _invalidate, resolve as _resolve
 
 logger = logging.getLogger("tropi_excel")
 
@@ -84,10 +84,11 @@ def _get_write_lock(ef: ExcelFile) -> threading.Lock:
 class _ExcelSession:
     """Holds a Graph workbook session for the duration of a ``with`` block."""
 
-    def __init__(self, ef: ExcelFile, token_provider: Any) -> None:
+    def __init__(self, ef: ExcelFile, token_provider: Any, re_resolve=None) -> None:
         self._ef = ef
         self._token_provider = token_provider
         self._session_id: str | None = None
+        self._re_resolve = re_resolve
 
     # --- headers -------------------------------------------------------------
 
@@ -134,6 +135,7 @@ class _ExcelSession:
         max_attempts = (
             CREATE_SESSION_NOT_FOUND_RETRIES if retry_not_found else MAX_RETRIES
         )
+        re_resolved = False
         for attempt in range(max_attempts + 1):
             r = requests.post(
                 f"{self._ef.item_base_url}/workbook/createSession",
@@ -143,6 +145,16 @@ class _ExcelSession:
             )
             if r.ok:
                 return r.json()["id"]
+            if r.status_code == 404 and self._re_resolve is not None and not re_resolved:
+                re_resolved = True
+                new_ef = self._re_resolve()
+                if new_ef is not None and new_ef.item_id != self._ef.item_id:
+                    logger.warning(
+                        "createSession 404 — stale item id, re-resolved %s → retrying",
+                        new_ef.source_key,
+                    )
+                    self._ef = new_ef
+                    continue   # retry immediately with fresh item, no sleep
             retriable = r.status_code == 504 or (
                 retry_not_found and r.status_code == 404
             )
@@ -264,7 +276,21 @@ class ExcelFileClient:
         server-side copy, so a transient post-copy 404 itemNotFound is retried
         (waiting for SharePoint to activate it) instead of failing immediately.
         """
-        sess = _ExcelSession(self._ef, self._token_provider)
+        def _re_resolve():
+            key = self._ef.source_key
+            if not key:
+                return None
+            try:
+                _invalidate(key)
+                new_ef = _resolve(key, self._token_provider)
+            except Exception as exc:
+                logger.warning("re-resolve of %s failed: %s", key, exc)
+                return None
+            self._ef = new_ef
+            self._write_lock = _get_write_lock(new_ef)
+            return new_ef
+
+        sess = _ExcelSession(self._ef, self._token_provider, re_resolve=_re_resolve)
         sess.open(retry_not_found=retry_not_found)
         self._session = sess
         try:
