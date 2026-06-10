@@ -31,9 +31,9 @@ from .errors import (
     ExcelThrottledError,
 )
 from .excelfile import ExcelFileClient
-from .resolve import ExcelFile, resolve
+from .resolve import ExcelFile, invalidate, resolve
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def open_workbook(
@@ -62,6 +62,7 @@ __all__ = [
     "ExcelFileClient",
     "ExcelFile",
     "resolve",
+    "invalidate",
     "TokenProvider",
     "BrokerTokenProvider",
     "LocalTokenProvider",
