@@ -54,14 +54,18 @@ logger = logging.getLogger("tropi_excel")
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 MAX_RETRIES = 3
-BACKOFF_BASE = 1.0   # seconds
+BACKOFF_BASE = 1.0   # seconds — used by 504 retry and 429/503 throttle paths
 BACKOFF_CAP = 30.0   # seconds
+# createSession not-found retry constants (separate from BACKOFF_BASE so the
+# 504 and throttle paths are not affected).  Starting at 0.5 s and doubling
+# gives delays 0.5, 1, 2, 4, 8, 16 → 6 sleeps → total wait budget ≈ 31.5s.
+NOT_FOUND_BACKOFF_BASE = 0.5   # seconds — first sleep before not-found retry
 # Extra createSession retries for a workbook that was JUST created — e.g. a
 # server-side copy in "new" mode. The drive item exists, but SharePoint has not
 # finished activating it for the Excel API, so createSession briefly returns
 # 404 itemNotFound. Only used when the caller opts in via
-# session(retry_not_found=True). Budget ≈ 1+2+4+8+16 = 31s of propagation lag.
-CREATE_SESSION_NOT_FOUND_RETRIES = 5
+# session(retry_not_found=True). Budget ≈ 0.5+1+2+4+8+16 = 31.5s.
+CREATE_SESSION_NOT_FOUND_RETRIES = 6
 BATCH_MAX = 20       # Graph $batch hard limit (requests per call)
 
 # Module-level write locks: (drive_id, item_id) → Lock
@@ -159,7 +163,15 @@ class _ExcelSession:
                 retry_not_found and r.status_code == 404
             )
             if retriable and attempt < max_attempts:
-                delay = min(BACKOFF_BASE * (2 ** attempt), BACKOFF_CAP)
+                # 404 not-found retries use NOT_FOUND_BACKOFF_BASE (0.5 s) so
+                # post-copy activation waits start fast.  504 gateway retries
+                # keep BACKOFF_BASE (1.0 s) — that path is unchanged.
+                base = (
+                    NOT_FOUND_BACKOFF_BASE
+                    if retry_not_found and r.status_code == 404
+                    else BACKOFF_BASE
+                )
+                delay = min(base * (2 ** attempt), BACKOFF_CAP)
                 logger.warning(
                     "createSession %d, retry %d/%d in %.1fs",
                     r.status_code, attempt + 1, max_attempts, delay,
