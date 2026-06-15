@@ -13,8 +13,19 @@ Two resolution strategies:
    Graph, then fetches the item ID via
    ``GET /sites/{siteId}/drives/{driveId}/root:/{path}:``.
 
-Both strategies cache results in a module-level dict keyed by
-(drive_id, item_id) so repeated calls to the same file are free.
+   Folder-ID pins
+   --------------
+   If the optional ``M365_FOLDER_IDS`` env var is set (the SAME var the
+   tropi_storage backend honours — JSON mapping a logical folder path to a
+   stable driveItem id), a path that falls under a pinned folder is addressed
+   by ``/drives/{drive_id}/items/{anchor_id}:/{remainder}`` instead of by name
+   (``/drives/{drive_id}/root:/{path}``).  Because the driveItem id survives a
+   folder rename/move within the drive, the Excel-fill path becomes
+   rename-proof too — matching the storage adapter.  Unset/empty => normal
+   name-based addressing (byte-identical to the pre-pin behaviour).
+
+Both strategies cache results in a module-level dict keyed by the input
+path/url so repeated calls to the same file are free.
 """
 from __future__ import annotations
 
@@ -34,6 +45,24 @@ if TYPE_CHECKING:
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 
+# tropi-storage-adapter routing — imported at module level so it can be
+# monkeypatched in tests and so URL-only callers (who never need it) still work
+# when the package is absent.
+try:
+    from tropi_storage.routing import (
+        load_folder_pins,
+        load_routes,
+        load_strip_prefix,
+        resolve_route,
+    )
+    from tropi_storage.path_utils import normalize_path
+
+    _HAS_STORAGE = True
+except ImportError:  # pragma: no cover - exercised only when the dep is missing
+    load_folder_pins = load_routes = load_strip_prefix = resolve_route = None  # type: ignore
+    normalize_path = None  # type: ignore
+    _HAS_STORAGE = False
+
 # Module-level resolution cache: key → (drive_id, item_id)
 _cache: dict[str, tuple[str, str]] = {}
 _cache_lock = threading.Lock()
@@ -41,6 +70,8 @@ _cache_lock = threading.Lock()
 # Module-level site-id / drive-id caches (same pattern as graph_backend.py)
 _site_id_cache: dict[str, str] = {}
 _drive_id_cache: dict[tuple[str, str | None], str] = {}
+# Per-drive resolved folder pins: drive_id → [(anchor_item_path, anchor_item_id)]
+_pins_by_drive: dict[str, list[tuple[str, str]]] = {}
 _id_cache_lock = threading.Lock()
 
 
@@ -117,14 +148,11 @@ def _resolve_from_url(url: str, token: str) -> tuple[str, str]:
 
 def _resolve_from_path(path: str, token: str) -> tuple[str, str]:
     """Logical path → (drive_id, item_id) via tropi-storage-adapter routing."""
-    try:
-        from tropi_storage.routing import load_routes, load_strip_prefix, resolve_route
-        from tropi_storage.path_utils import normalize_path
-    except ImportError as exc:
+    if not _HAS_STORAGE:
         raise ExcelResolveError(
             "tropi-storage-adapter is not installed; "
             "install it or pass a SharePoint URL instead of a logical path."
-        ) from exc
+        )
 
     routes = load_routes()
     strip_prefix = load_strip_prefix()
@@ -138,7 +166,6 @@ def _resolve_from_path(path: str, token: str) -> tuple[str, str]:
         )
 
     try:
-        from tropi_storage.exceptions import BackendError
         site_path, drive_name, item_path = resolve_route(
             path, routes, default_site, default_drive, strip_prefix=strip_prefix
         )
@@ -149,21 +176,110 @@ def _resolve_from_path(path: str, token: str) -> tuple[str, str]:
 
     drive_id = _resolve_drive_id(site_path, drive_name, hostname, token)
 
-    # Fetch the item by path under the drive.
     p = normalize_path(item_path)
     if p == "/":
         raise ExcelResolveError(
             f"Path {path!r} resolved to the library root — specify a file path."
         )
-    encoded = urllib.parse.quote(p.lstrip("/"), safe="/")
-    r = requests.get(
-        f"{GRAPH}/drives/{drive_id}/root:/{encoded}",
-        headers=_auth_headers(token),
-        timeout=30,
+
+    item_url = _build_item_url(
+        drive_id, p, routes, default_site, default_drive, strip_prefix, hostname, token
     )
+    r = requests.get(item_url, headers=_auth_headers(token), timeout=30)
     _raise_for_status(r)
     item_id: str = r.json()["id"]
     return drive_id, item_id
+
+
+def _build_item_url(
+    drive_id: str,
+    item_path: str,
+    routes,
+    default_site: str | None,
+    default_drive: str | None,
+    strip_prefix: str | None,
+    hostname: str,
+    token: str,
+) -> str:
+    """Return the Graph URL that fetches *item_path* within *drive_id*.
+
+    Normally ``/drives/{drive_id}/root:/{path}`` (name-based).  When the path
+    falls under a folder pinned via ``M365_FOLDER_IDS`` it becomes
+    ``/drives/{drive_id}/items/{anchor_id}:/{remainder}`` — addressed by the
+    stable anchor id, so a rename/move of the pinned folder (or any ancestor)
+    does not break resolution.  Mirrors tropi_storage's ``_build_item_url``.
+    """
+    pins = _pins_for_drive(
+        drive_id, routes, default_site, default_drive, strip_prefix, hostname, token
+    )
+    match = _match_pin(item_path, pins)
+    if match is not None:
+        anchor_id, rel = match
+        if rel == "/":
+            # The path IS the pinned folder itself (no sub-path).
+            return f"{GRAPH}/drives/{drive_id}/items/{anchor_id}"
+        enc = urllib.parse.quote(rel.lstrip("/"), safe="/")
+        return f"{GRAPH}/drives/{drive_id}/items/{anchor_id}:/{enc}"
+
+    encoded = urllib.parse.quote(item_path.lstrip("/"), safe="/")
+    return f"{GRAPH}/drives/{drive_id}/root:/{encoded}"
+
+
+def _match_pin(
+    item_path: str, pins: list[tuple[str, str]]
+) -> tuple[str, str] | None:
+    """Return (anchor_item_id, relative_path) if *item_path* is at/under a pin.
+
+    *relative_path* keeps a leading slash; it is "/" when *item_path* IS the
+    pinned anchor.  Returns None when no pin matches.  The ``anchor + "/"``
+    guard prevents a sibling false match (anchor ``/A/B`` must not match
+    ``/A/BC/...``).
+    """
+    for anchor, item_id in pins:
+        if item_path == anchor:
+            return item_id, "/"
+        if anchor != "/" and item_path.startswith(anchor + "/"):
+            return item_id, item_path[len(anchor):]
+    return None
+
+
+def _pins_for_drive(
+    drive_id: str,
+    routes,
+    default_site: str | None,
+    default_drive: str | None,
+    strip_prefix: str | None,
+    hostname: str,
+    token: str,
+) -> list[tuple[str, str]]:
+    """Return [(anchor_item_path, item_id)] for pins that live in *drive_id*.
+
+    Each configured pin's logical path is routed to (site, library) → drive id;
+    only those whose drive matches *drive_id* are kept (the same
+    ``M365_FOLDER_IDS`` value is shared across services with differing route
+    tables, so non-routable pins are skipped).  Resolved once per drive and
+    cached.  Empty list when ``M365_FOLDER_IDS`` is unset.
+    """
+    with _id_cache_lock:
+        cached = _pins_by_drive.get(drive_id)
+    if cached is not None:
+        return cached
+
+    resolved: list[tuple[str, str]] = []
+    for anchor_logical, item_id in load_folder_pins().items():
+        try:
+            sp, dn, anchor_item_path = resolve_route(
+                anchor_logical, routes, default_site, default_drive,
+                strip_prefix=strip_prefix,
+            )
+            if _resolve_drive_id(sp, dn, hostname, token) == drive_id:
+                resolved.append((normalize_path(anchor_item_path), item_id))
+        except Exception:
+            continue
+
+    with _id_cache_lock:
+        _pins_by_drive[drive_id] = resolved
+    return resolved
 
 
 def _resolve_site_id(site_path: str, hostname: str, token: str) -> str:

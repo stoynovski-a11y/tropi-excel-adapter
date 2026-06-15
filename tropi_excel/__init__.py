@@ -33,7 +33,7 @@ from .errors import (
 from .excelfile import ExcelFileClient
 from .resolve import ExcelFile, invalidate, resolve
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 
 def open_workbook(
